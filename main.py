@@ -25,6 +25,7 @@ from kivy.lang import Builder
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.uix.widget import Widget
+from kivy.uix.video import Video
 from kivy.animation import Animation
 from kivy.metrics import dp
 from kivy.graphics import Color, Line, RoundedRectangle, Rectangle
@@ -35,6 +36,16 @@ from kivymd.uix.button import MDFlatButton
 from kivymd.uix.list import TwoLineListItem
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.boxlayout import MDBoxLayout
+
+try:
+    from jnius import autoclass
+except Exception:
+    autoclass = None
+try:
+    from android.permissions import request_permissions, Permission
+except Exception:
+    request_permissions = None
+    Permission = None
 
 if hasattr(Window, "size"):
     Window.size = (420, 760)
@@ -47,7 +58,12 @@ ENCRYPTED_MODEL = MODEL_PATH.with_suffix(MODEL_PATH.suffix + ".aes")
 DB_PATH = Path("chat_history.db.aes")
 KEY_PATH = Path(".enc_key")
 EXPECTED_HASH = "8e4f4856fb84bafb895f1eb08e6c03e4be613ead2d942f91561aeac742a619aa"
+MEDIA_DIR = Path("media")
+CHUNKS_DIR = MEDIA_DIR / "chunks"
+CHUNK_SECONDS = 30
+CHUNK_KEEP_LIMIT = 2000
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
 
 _CRYPTO_LOCK = RLock()
 _MODEL_LOCK = RLock()
@@ -145,6 +161,43 @@ async def init_db(key: bytes):
         try:
             async with aiosqlite.connect(str(tmp_plain)) as db:
                 await db.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)")
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS security_events (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, kind TEXT, severity TEXT, details TEXT, chain_hash TEXT)"
+                )
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS security_state (state_key TEXT PRIMARY KEY, state_value TEXT)"
+                )
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS media_chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, path TEXT, duration INTEGER, signature TEXT, alert INTEGER)"
+                )
+                await db.commit()
+            enc = aes_encrypt(tmp_plain.read_bytes(), key)
+            _atomic_write_bytes(DB_PATH, enc)
+        finally:
+            try:
+                tmp_plain.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+async def ensure_db_schema(key: bytes):
+    with _CRYPTO_LOCK:
+        if not DB_PATH.exists():
+            await init_db(key)
+            return
+        tmp_plain = _tmp_path("db_schema", ".db")
+        try:
+            decrypt_file(DB_PATH, tmp_plain, key)
+            async with aiosqlite.connect(str(tmp_plain)) as db:
+                await db.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, prompt TEXT, response TEXT)")
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS security_events (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, kind TEXT, severity TEXT, details TEXT, chain_hash TEXT)"
+                )
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS security_state (state_key TEXT PRIMARY KEY, state_value TEXT)"
+                )
+                await db.execute(
+                    "CREATE TABLE IF NOT EXISTS media_chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, path TEXT, duration INTEGER, signature TEXT, alert INTEGER)"
+                )
                 await db.commit()
             enc = aes_encrypt(tmp_plain.read_bytes(), key)
             _atomic_write_bytes(DB_PATH, enc)
@@ -199,6 +252,127 @@ async def fetch_history(key: bytes, limit: int = 20, offset: int = 0, search: Op
                     ) as cur:
                         async for r in cur:
                             rows.append(r)
+            enc = aes_encrypt(tmp_plain.read_bytes(), key)
+            _atomic_write_bytes(DB_PATH, enc)
+        finally:
+            try:
+                tmp_plain.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return rows
+
+async def fetch_security_state(key: bytes, state_key: str) -> Optional[str]:
+    with _CRYPTO_LOCK:
+        if not DB_PATH.exists():
+            await init_db(key)
+        tmp_plain = _tmp_path("sec_state_read", ".db")
+        try:
+            decrypt_file(DB_PATH, tmp_plain, key)
+            async with aiosqlite.connect(str(tmp_plain)) as db:
+                async with db.execute(
+                    "SELECT state_value FROM security_state WHERE state_key = ?",
+                    (state_key,),
+                ) as cur:
+                    row = await cur.fetchone()
+            enc = aes_encrypt(tmp_plain.read_bytes(), key)
+            _atomic_write_bytes(DB_PATH, enc)
+            return row[0] if row else None
+        finally:
+            try:
+                tmp_plain.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+async def upsert_security_state(key: bytes, state_key: str, state_value: str):
+    with _CRYPTO_LOCK:
+        if not DB_PATH.exists():
+            await init_db(key)
+        tmp_plain = _tmp_path("sec_state_write", ".db")
+        try:
+            decrypt_file(DB_PATH, tmp_plain, key)
+            async with aiosqlite.connect(str(tmp_plain)) as db:
+                await db.execute(
+                    "INSERT INTO security_state (state_key, state_value) VALUES (?, ?) ON CONFLICT(state_key) DO UPDATE SET state_value = excluded.state_value",
+                    (state_key, state_value),
+                )
+                await db.commit()
+            enc = aes_encrypt(tmp_plain.read_bytes(), key)
+            _atomic_write_bytes(DB_PATH, enc)
+        finally:
+            try:
+                tmp_plain.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+async def append_security_event(key: bytes, kind: str, severity: str, details: str):
+    with _CRYPTO_LOCK:
+        if not DB_PATH.exists():
+            await init_db(key)
+        tmp_plain = _tmp_path("sec_event", ".db")
+        try:
+            decrypt_file(DB_PATH, tmp_plain, key)
+            async with aiosqlite.connect(str(tmp_plain)) as db:
+                async with db.execute(
+                    "SELECT chain_hash FROM security_events ORDER BY id DESC LIMIT 1"
+                ) as cur:
+                    row = await cur.fetchone()
+                prev_hash = row[0] if row else "0" * 64
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                payload = f"{prev_hash}|{stamp}|{kind}|{severity}|{details}"
+                chain_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                await db.execute(
+                    "INSERT INTO security_events (timestamp, kind, severity, details, chain_hash) VALUES (?, ?, ?, ?, ?)",
+                    (stamp, kind, severity, details, chain_hash),
+                )
+                await db.commit()
+            enc = aes_encrypt(tmp_plain.read_bytes(), key)
+            _atomic_write_bytes(DB_PATH, enc)
+        finally:
+            try:
+                tmp_plain.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+async def append_media_chunk(key: bytes, path: str, duration: int, signature: str, alert: bool):
+    with _CRYPTO_LOCK:
+        if not DB_PATH.exists():
+            await init_db(key)
+        tmp_plain = _tmp_path("media_chunk", ".db")
+        try:
+            decrypt_file(DB_PATH, tmp_plain, key)
+            async with aiosqlite.connect(str(tmp_plain)) as db:
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                await db.execute(
+                    "INSERT INTO media_chunks (timestamp, path, duration, signature, alert) VALUES (?, ?, ?, ?, ?)",
+                    (stamp, path, duration, signature, 1 if alert else 0),
+                )
+                await db.commit()
+            enc = aes_encrypt(tmp_plain.read_bytes(), key)
+            _atomic_write_bytes(DB_PATH, enc)
+        finally:
+            try:
+                tmp_plain.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+async def fetch_media_chunks(key: bytes, alert_only: bool = False, limit: int = 30, offset: int = 0):
+    with _CRYPTO_LOCK:
+        if not DB_PATH.exists():
+            await init_db(key)
+        tmp_plain = _tmp_path("media_chunks", ".db")
+        rows = []
+        try:
+            decrypt_file(DB_PATH, tmp_plain, key)
+            async with aiosqlite.connect(str(tmp_plain)) as db:
+                if alert_only:
+                    query = "SELECT id,timestamp,path,duration,signature,alert FROM media_chunks WHERE alert = 1 ORDER BY id DESC LIMIT ? OFFSET ?"
+                    args = (limit, offset)
+                else:
+                    query = "SELECT id,timestamp,path,duration,signature,alert FROM media_chunks ORDER BY id DESC LIMIT ? OFFSET ?"
+                    args = (limit, offset)
+                async with db.execute(query, args) as cur:
+                    async for r in cur:
+                        rows.append(r)
             enc = aes_encrypt(tmp_plain.read_bytes(), key)
             _atomic_write_bytes(DB_PATH, enc)
         finally:
@@ -424,6 +598,88 @@ def entropic_summary_text(score: float) -> str:
 def _simple_tokenize(text: str) -> List[str]:
     return [t for t in re.findall(r"[A-Za-z0-9_\-]+", text.lower())]
 
+def llm_detection_signal(text: str) -> Tuple[str, float]:
+    toks = _simple_tokenize(text)
+    if not toks:
+        return "low", 0.0
+    uniq = len(set(toks))
+    rep_ratio = 1.0 - (uniq / max(1, len(toks)))
+    avg_len = sum(len(t) for t in toks) / max(1, len(toks))
+    ai_markers = sum(1 for t in toks if t in {"model", "llm", "assistant", "prompt", "temperature", "token"})
+    score = (rep_ratio * 0.6) + (min(avg_len / 8.0, 1.0) * 0.2) + (min(ai_markers / 4.0, 1.0) * 0.2)
+    score = max(0.0, min(1.0, score))
+    if score >= 0.7:
+        return "high", score
+    if score >= 0.4:
+        return "medium", score
+    return "low", score
+
+def frame_signature_hash(signature: str) -> str:
+    cleaned = (signature or "").strip().encode("utf-8")
+    return hashlib.sha256(cleaned).hexdigest()
+
+def is_android() -> bool:
+    return bool(os.environ.get("ANDROID_ARGUMENT") or os.environ.get("ANDROID_BOOTLOGO"))
+
+def compute_chunk_signature(path: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        size = path.stat().st_size
+        h.update(str(size).encode("utf-8"))
+        with path.open("rb") as f:
+            head = f.read(4096)
+            if head:
+                h.update(head)
+            if size > 4096:
+                f.seek(max(0, size - 4096))
+                tail = f.read(4096)
+                if tail:
+                    h.update(tail)
+    except Exception:
+        h.update(os.urandom(16))
+    return h.hexdigest()
+
+class AndroidRecorder:
+    def __init__(self):
+        self._recorder = None
+        self._output_path = None
+    def start(self, output_path: str):
+        if autoclass is None:
+            raise RuntimeError("pyjnius not available")
+        MediaRecorder = autoclass("android.media.MediaRecorder")
+        CamcorderProfile = autoclass("android.media.CamcorderProfile")
+        recorder = MediaRecorder()
+        recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+        recorder.setVideoSource(MediaRecorder.VideoSource.CAMERA)
+        profile = CamcorderProfile.get(CamcorderProfile.QUALITY_480P)
+        recorder.setOutputFormat(profile.fileFormat)
+        recorder.setVideoEncoder(profile.videoCodec)
+        recorder.setAudioEncoder(profile.audioCodec)
+        recorder.setVideoEncodingBitRate(profile.videoBitRate)
+        recorder.setVideoFrameRate(profile.videoFrameRate)
+        recorder.setVideoSize(profile.videoFrameWidth, profile.videoFrameHeight)
+        recorder.setAudioEncodingBitRate(profile.audioBitRate)
+        recorder.setAudioSamplingRate(profile.audioSampleRate)
+        recorder.setOutputFile(output_path)
+        recorder.prepare()
+        recorder.start()
+        self._recorder = recorder
+        self._output_path = output_path
+    def stop(self):
+        if self._recorder is None:
+            return
+        try:
+            self._recorder.stop()
+        except Exception:
+            pass
+        try:
+            self._recorder.reset()
+            self._recorder.release()
+        except Exception:
+            pass
+        self._recorder = None
+        return self._output_path
+
 def punkd_analyze(prompt_text: str, top_n: int = 12) -> Dict[str, float]:
     toks = _simple_tokenize(prompt_text)
     freq = {}
@@ -495,7 +751,7 @@ def chunked_generate(llm: Llama, prompt: str, max_total_tokens: int = 256, chunk
         cur_prompt = prompt + "\n\nAssistant so far:\n" + assembled + "\n\nContinue:"
     return assembled.strip()
 
-def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -> str:
+def build_security_scanner_prompt(data: dict, include_system_entropy: bool = True) -> str:
     entropy_text = "entropic_score=unknown"
     if include_system_entropy:
         metrics = collect_system_metrics()
@@ -512,33 +768,35 @@ def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -
     else:
         metrics_line = "sys_metrics: disabled"
     return (
-        "You are a Hypertime Nanobot specialized Road Risk Classification AI trained to evaluate real-world driving scenes.\n"
-        "Analyze and Triple Check for validating accuracy the environmental and sensor data and determine the overall road risk level.\n"
+        "You are an active security scanner AI running 24/7 for live site monitoring.\n"
+        "Analyze the provided security context and determine the overall risk level.\n"
         "Your reply must be only one word: Low, Medium, or High.\n\n"
         "[tuning]\n"
-        "Scene details:\n"
-        f"Location: {data.get('location','unspecified location')}\n"
-        f"Road type: {data.get('road_type','unknown')}\n"
-        f"Weather: {data.get('weather','unknown')}\n"
-        f"Traffic: {data.get('traffic','unknown')}\n"
-        f"Obstacles: {data.get('obstacles','none')}\n"
-        f"Sensor notes: {data.get('sensor_notes','none')}\n"
+        "Security context:\n"
+        f"Site: {data.get('site','unspecified site')}\n"
+        f"Zone: {data.get('zone','unknown')}\n"
+        f"Human activity: {data.get('human_activity','unknown')}\n"
+        f"Camera notes: {data.get('camera_notes','none')}\n"
+        f"Access control: {data.get('access_control','unknown')}\n"
+        f"Frame signature: {data.get('frame_signature','none')}\n"
+        f"LLM detection notes: {data.get('llm_detection','none')}\n"
+        f"Tamper evidence: {data.get('tamper_evidence','none')}\n"
         f"{metrics_line}\n"
         f"Quantum State: {entropy_text}\n"
         "[/tuning]\n\n"
         "Follow these strict rules when forming your decision:\n"
         "- Think through all scene factors internally but do not show reasoning.\n"
-        "- Evaluate surface, visibility, weather, traffic, and obstacles holistically.\n"
+        "- Evaluate human activity, access anomalies, and frame-change signals holistically.\n"
         "- Optionally use the system entropic signal to bias your internal confidence slightly.\n"
         "- Choose only one risk level that best fits the entire situation.\n"
         "- Output exactly one word, with no punctuation or labels.\n"
         "- The valid outputs are only: Low, Medium, High.\n\n"
         "[action]\n"
         "1) Normalize sensor inputs to comparable scales.\n"
-        "3) Map environmental risk cues -> discrete label using conservative thresholds.\n"
-        "4) If sensor integrity anomalies are detected, bias toward higher risk.\n"
-        "5) PUNKD: detect key tokens and locally adjust attention/temperature slightly to focus decisions.\n"
-        "6) Do not output internal reasoning or diagnostics; only return the single-word label.\n"
+        "2) Flag frame-change or tamper indicators; bias toward higher risk.\n"
+        "3) Map security risk cues -> discrete label using conservative thresholds.\n"
+        "4) PUNKD: detect key tokens and locally adjust attention/temperature slightly to focus decisions.\n"
+        "5) Do not output internal reasoning or diagnostics; only return the single-word label.\n"
         "[/action]\n\n"
         "[replytemplate]\n"
         "Low | Medium | High\n"
@@ -548,7 +806,7 @@ def build_road_scanner_prompt(data: dict, include_system_entropy: bool = True) -
 async def mobile_ensure_init() -> bytes:
     key = get_or_create_key()
     try:
-        await init_db(key)
+        await ensure_db_schema(key)
     except Exception:
         pass
     return key
@@ -610,9 +868,22 @@ async def mobile_run_chat(prompt: str) -> str:
     except FileNotFoundError:
         return "[Model not found. Place or download the GGUF model on device.]"
 
-async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
+async def mobile_run_security_scan(data: dict) -> Tuple[str, str, Dict[str, str]]:
     key = await mobile_ensure_init()
-    prompt = build_road_scanner_prompt(data, include_system_entropy=True)
+    prompt = build_security_scanner_prompt(data, include_system_entropy=True)
+    frame_sig = data.get("frame_signature", "")
+    frame_hash = frame_signature_hash(frame_sig) if frame_sig else ""
+    prior_hash = ""
+    frame_changed = False
+    if frame_hash:
+        try:
+            prior_hash = await fetch_security_state(key, "last_frame_hash") or ""
+            frame_changed = bool(prior_hash and prior_hash != frame_hash)
+            await upsert_security_state(key, "last_frame_hash", frame_hash)
+        except Exception:
+            frame_changed = False
+    llm_level, llm_score = llm_detection_signal(data.get("llm_detection", ""))
+    tamper_note = data.get("tamper_evidence", "none")
     try:
         with acquire_plain_model(key) as model_path:
             loop = asyncio.get_running_loop()
@@ -638,16 +909,30 @@ async def mobile_run_road_scan(data: dict) -> Tuple[str, str]:
                     else:
                         label = "Medium"
                 try:
-                    await log_interaction("ROAD_SCANNER_PROMPT:\n" + prompt, "ROAD_SCANNER_RESULT:\n" + label, key)
+                    await log_interaction("SECURITY_SCANNER_PROMPT:\n" + prompt, "SECURITY_SCANNER_RESULT:\n" + label, key)
                 except Exception:
                     pass
                 try:
                     del llm
                 except Exception:
                     pass
-                return label, text
+                meta = {
+                    "frame_changed": "YES" if frame_changed else "no",
+                    "llm_detection": f"{llm_level} ({llm_score:.2f})",
+                    "tamper_evidence": tamper_note or "none",
+                }
+                try:
+                    await append_security_event(
+                        key,
+                        kind="scan",
+                        severity=label.lower(),
+                        details=f"frame_changed={meta['frame_changed']} llm={meta['llm_detection']} tamper={meta['tamper_evidence']}",
+                    )
+                except Exception:
+                    pass
+                return label, text, meta
     except FileNotFoundError:
-        return "[Model not found]", "[Model not found. Place or download the GGUF model on device.]"
+        return "[Model not found]", "[Model not found. Place or download the GGUF model on device.]", {"frame_changed": "unknown", "llm_detection": "unknown", "tamper_evidence": "unknown"}
 
 class BackgroundGradient(Widget):
     top_color = ListProperty([0.07, 0.09, 0.14, 1])
@@ -710,6 +995,22 @@ class GlassCard(Widget):
                 sx = x + w * self._shine_x
                 Color(1, 1, 1, float(self._shine_alpha))
                 Rectangle(pos=(sx, y), size=(w * 0.18, h))
+
+class ColorTab(Widget):
+    rgb = ListProperty([0.2, 0.6, 0.9, 1.0])
+    radius = NumericProperty(dp(12))
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(pos=self._redraw, size=self._redraw, rgb=self._redraw, radius=self._redraw)
+    def _redraw(self, *args):
+        self.canvas.clear()
+        x, y = self.pos
+        w, h = self.size
+        with self.canvas:
+            Color(0, 0, 0, 0.3)
+            RoundedRectangle(pos=(x, y - dp(1)), size=(w, h + dp(2)), radius=[self.radius])
+            Color(*self.rgb)
+            RoundedRectangle(pos=(x, y), size=(w, h), radius=[self.radius])
 
 class RiskWheelNeo(Widget):
     value = NumericProperty(0.5)
@@ -801,6 +1102,8 @@ KV = r"""
     size_hint: 1, 1
 <GlassCard>:
     size_hint: 1, None
+<ColorTab>:
+    size_hint: None, None
 <RiskWheelNeo>:
     size_hint: None, None
 
@@ -808,7 +1111,7 @@ MDScreen:
     MDBoxLayout:
         orientation: "vertical"
         MDToolbar:
-            title: "Secure LLM Road Scanner"
+            title: "Secure LLM Security Scanner"
             elevation: 10
         MDLabel:
             id: status_label
@@ -862,7 +1165,7 @@ MDScreen:
                                 on_release: app.on_chat_send()
 
             MDScreen:
-                name: "road"
+                name: "scanner"
                 BackgroundGradient:
                     top_color: 0.07, 0.09, 0.14, 1
                     bottom_color: 0.02, 0.03, 0.05, 1
@@ -888,7 +1191,7 @@ MDScreen:
                             pos: self.parent.pos
                             size: self.parent.size
                             MDLabel:
-                                text: "Road Risk Scanner"
+                                text: "Active Security Scanner"
                                 bold: True
                                 font_style: "H6"
                                 halign: "center"
@@ -902,6 +1205,18 @@ MDScreen:
                                     id: risk_wheel
                                     size: "240dp", "240dp"
                                     pos_hint: {"center_x": 0.5, "center_y": 0.55}
+                            MDBoxLayout:
+                                size_hint_y: None
+                                height: "26dp"
+                                spacing: "8dp"
+                                MDLabel:
+                                    text: "Entropic Color Tab"
+                                    theme_text_color: "Secondary"
+                                    size_hint_x: 0.7
+                                ColorTab:
+                                    id: entropic_tab
+                                    size: "70dp", "18dp"
+                                    pos_hint: {"center_y": 0.5}
                             MDLabel:
                                 id: risk_text
                                 text: "RISK: —"
@@ -909,37 +1224,69 @@ MDScreen:
                                 size_hint_y: None
                                 height: "22dp"
                             MDTextField:
-                                id: loc_field
-                                hint_text: "Location (e.g., I-95 NB mile 12)"
+                                id: site_field
+                                hint_text: "Site (e.g., HQ East)"
                                 mode: "fill"
                                 fill_color: 1, 1, 1, 0.06
                             MDTextField:
-                                id: road_type_field
-                                hint_text: "Road type (highway/urban/residential)"
+                                id: zone_field
+                                hint_text: "Zone (loading dock / lobby)"
                                 mode: "fill"
                                 fill_color: 1, 1, 1, 0.06
                             MDTextField:
-                                id: weather_field
-                                hint_text: "Weather/visibility"
+                                id: human_field
+                                hint_text: "Human activity (none / loitering / crowd)"
                                 mode: "fill"
                                 fill_color: 1, 1, 1, 0.06
                             MDTextField:
-                                id: traffic_field
-                                hint_text: "Traffic density (low/med/high)"
+                                id: camera_field
+                                hint_text: "Camera notes (angle / obstruction)"
                                 mode: "fill"
                                 fill_color: 1, 1, 1, 0.06
                             MDTextField:
-                                id: obstacles_field
-                                hint_text: "Reported obstacles"
+                                id: access_field
+                                hint_text: "Access control (locked / open / forced)"
                                 mode: "fill"
                                 fill_color: 1, 1, 1, 0.06
                             MDTextField:
-                                id: sensor_notes_field
-                                hint_text: "Sensor notes"
+                                id: frame_field
+                                hint_text: "Frame signature / hash"
                                 mode: "fill"
                                 fill_color: 1, 1, 1, 0.06
+                            MDTextField:
+                                id: llm_field
+                                hint_text: "LLM detection notes (if any)"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDTextField:
+                                id: tamper_field
+                                hint_text: "Tamper evidence"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDLabel:
+                                id: alert_status
+                                text: "Alerts: —"
+                                theme_text_color: "Secondary"
+                                size_hint_y: None
+                                height: "20dp"
+                            MDBoxLayout:
+                                spacing: "8dp"
+                                size_hint_y: None
+                                height: "44dp"
+                                MDRaisedButton:
+                                    text: "Start 24/7 Capture"
+                                    on_release: app.gui_start_capture()
+                                MDRaisedButton:
+                                    text: "Stop Capture"
+                                    on_release: app.gui_stop_capture()
+                            MDLabel:
+                                id: capture_status
+                                text: "Capture: idle"
+                                theme_text_color: "Secondary"
+                                size_hint_y: None
+                                height: "20dp"
                             MDRaisedButton:
-                                text: "Scan Risk"
+                                text: "Scan Security Risk"
                                 size_hint_x: 1
                                 on_release: app.on_scan()
                             MDLabel:
@@ -1136,6 +1483,61 @@ MDScreen:
                                 text: "—"
                                 theme_text_color: "Secondary"
 
+            MDScreen:
+                name: "playback"
+                BackgroundGradient:
+                    top_color: 0.06, 0.08, 0.13, 1
+                    bottom_color: 0.02, 0.03, 0.05, 1
+                MDBoxLayout:
+                    orientation: "vertical"
+                    padding: "10dp"
+                    spacing: "10dp"
+                    FloatLayout:
+                        GlassCard:
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            height: self.parent.height
+                            radius: dp(26)
+                            fill: 1, 1, 1, 0.05
+                            border: 1, 1, 1, 0.12
+                            highlight: 1, 1, 1, 0.07
+                        MDBoxLayout:
+                            orientation: "vertical"
+                            padding: "14dp"
+                            spacing: "10dp"
+                            pos: self.parent.pos
+                            size: self.parent.size
+                            MDLabel:
+                                text: "Playback (Heightened Events)"
+                                bold: True
+                                font_style: "H6"
+                                size_hint_y: None
+                                height: "32dp"
+                            Video:
+                                id: playback_video
+                                state: "stop"
+                                allow_stretch: True
+                                keep_ratio: True
+                            MDLabel:
+                                id: playback_status
+                                text: "Select a chunk to play."
+                                theme_text_color: "Secondary"
+                                size_hint_y: None
+                                height: "20dp"
+                            ScrollView:
+                                MDList:
+                                    id: playback_list
+                            MDBoxLayout:
+                                spacing: "8dp"
+                                size_hint_y: None
+                                height: "44dp"
+                                MDRaisedButton:
+                                    text: "Refresh"
+                                    on_release: app.gui_playback_refresh()
+                                MDRaisedButton:
+                                    text: "Stop"
+                                    on_release: app.gui_playback_stop()
+
         MDBottomNavigation:
             panel_color: 0.08,0.09,0.12,1
             MDBottomNavigationItem:
@@ -1144,10 +1546,10 @@ MDScreen:
                 icon: "chat"
                 on_tab_press: app.switch_screen("chat")
             MDBottomNavigationItem:
-                name: "nav_road"
-                text: "Road"
-                icon: "road-variant"
-                on_tab_press: app.switch_screen("road")
+                name: "nav_scanner"
+                text: "Scanner"
+                icon: "shield-search"
+                on_tab_press: app.switch_screen("scanner")
             MDBottomNavigationItem:
                 name: "nav_model"
                 text: "Model"
@@ -1163,6 +1565,11 @@ MDScreen:
                 text: "Security"
                 icon: "shield-lock-outline"
                 on_tab_press: app.switch_screen("security")
+            MDBottomNavigationItem:
+                name: "nav_playback"
+                text: "Playback"
+                icon: "play-circle-outline"
+                on_tab_press: app.switch_screen("playback")
 """
 
 class SecureLLMApp(MDApp):
@@ -1170,12 +1577,22 @@ class SecureLLMApp(MDApp):
     _hist_page = 0
     _hist_per_page = 10
     _hist_search = None
+    _capture_running = False
+    _capture_thread = None
+    _playback_page = 0
+    _playback_per_page = 20
+    _playback_alert_only = True
+    _playback_tmp = None
     def build(self):
-        self.title = "Secure LLM Road Scanner"
+        self.title = "Secure LLM Security Scanner"
         self.theme_cls.primary_palette = "Blue"
         root = Builder.load_string(KV)
+        if request_permissions and Permission:
+            request_permissions([Permission.CAMERA, Permission.RECORD_AUDIO, Permission.WRITE_EXTERNAL_STORAGE])
         Clock.schedule_once(lambda dt: self.gui_model_refresh(), 0.2)
         Clock.schedule_once(lambda dt: self.gui_history_refresh(), 0.3)
+        Clock.schedule_once(lambda dt: self.gui_model_autoprepare(), 0.4)
+        Clock.schedule_once(lambda dt: self.gui_playback_refresh(), 0.6)
         return root
     def switch_screen(self, name: str):
         self.root.ids.screen_manager.current = name
@@ -1218,32 +1635,131 @@ class SecureLLMApp(MDApp):
         self.append_chat("Model", reply)
         self.set_status("")
     def on_scan(self):
-        road_screen = self.root.ids.screen_manager.get_screen("road")
+        road_screen = self.root.ids.screen_manager.get_screen("scanner")
         data = {
-            "location": road_screen.ids.loc_field.text.strip() or "unspecified location",
-            "road_type": road_screen.ids.road_type_field.text.strip() or "highway",
-            "weather": road_screen.ids.weather_field.text.strip() or "clear",
-            "traffic": road_screen.ids.traffic_field.text.strip() or "low",
-            "obstacles": road_screen.ids.obstacles_field.text.strip() or "none",
-            "sensor_notes": road_screen.ids.sensor_notes_field.text.strip() or "none",
+            "site": road_screen.ids.site_field.text.strip() or "unspecified site",
+            "zone": road_screen.ids.zone_field.text.strip() or "unknown",
+            "human_activity": road_screen.ids.human_field.text.strip() or "unknown",
+            "camera_notes": road_screen.ids.camera_field.text.strip() or "none",
+            "access_control": road_screen.ids.access_field.text.strip() or "unknown",
+            "frame_signature": road_screen.ids.frame_field.text.strip() or "none",
+            "llm_detection": road_screen.ids.llm_field.text.strip() or "none",
+            "tamper_evidence": road_screen.ids.tamper_field.text.strip() or "none",
         }
-        self.set_status("Scanning road risk...")
+        self.set_status("Scanning security risk...")
         threading.Thread(target=self._scan_worker, args=(data,), daemon=True).start()
     def _scan_worker(self, data: dict):
         try:
-            label, raw = asyncio.run(mobile_run_road_scan(data))
+            label, raw, meta = asyncio.run(mobile_run_security_scan(data))
         except Exception as e:
-            label, raw = "[Error]", f"[Error: {e}]"
-        Clock.schedule_once(lambda dt: self._scan_finish(label, raw))
-    def _scan_finish(self, label: str, raw: str):
-        road_screen = self.root.ids.screen_manager.get_screen("road")
+            label, raw, meta = "[Error]", f"[Error: {e}]", {"frame_changed": "unknown", "llm_detection": "unknown", "tamper_evidence": "unknown"}
+        Clock.schedule_once(lambda dt: self._scan_finish(label, raw, meta))
+    def _scan_finish(self, label: str, raw: str, meta: Dict[str, str]):
+        road_screen = self.root.ids.screen_manager.get_screen("scanner")
         try:
             road_screen.ids.risk_wheel.set_level(label)
             road_screen.ids.risk_text.text = f"RISK: {label.upper()}"
         except Exception:
             pass
         road_screen.ids.scan_result.text = label
+        try:
+            road_screen.ids.alert_status.text = f"Alerts: frame_change={meta.get('frame_changed')} llm={meta.get('llm_detection')} tamper={meta.get('tamper_evidence')}"
+        except Exception:
+            pass
+        try:
+            metrics = collect_system_metrics()
+            rgb = metrics_to_rgb(metrics)
+            road_screen.ids.entropic_tab.rgb = [rgb[0], rgb[1], rgb[2], 1.0]
+        except Exception:
+            pass
         self.set_status("")
+    def gui_start_capture(self):
+        if self._capture_running:
+            return
+        self._capture_running = True
+        self.root.ids.capture_status.text = "Capture: starting..."
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._capture_thread.start()
+    def gui_stop_capture(self):
+        if not self._capture_running:
+            return
+        self._capture_running = False
+        self.root.ids.capture_status.text = "Capture: stopping..."
+    def _capture_loop(self):
+        if not is_android():
+            Clock.schedule_once(lambda dt: setattr(self.root.ids.capture_status, "text", "Capture: Android only"), 0)
+            self._capture_running = False
+            return
+        recorder = AndroidRecorder()
+        while self._capture_running:
+            try:
+                tmp_path = _tmp_path("capture_chunk", ".mp4")
+                recorder.start(str(tmp_path))
+                start_time = time.time()
+                while self._capture_running and (time.time() - start_time) < CHUNK_SECONDS:
+                    time.sleep(0.5)
+                out_path = recorder.stop()
+                if not out_path:
+                    continue
+                chunk_path = self._finalize_chunk(Path(out_path))
+                Clock.schedule_once(lambda dt, p=chunk_path: setattr(self.root.ids.capture_status, "text", f"Capture: saved {p.name}"), 0)
+            except Exception as e:
+                Clock.schedule_once(lambda dt: setattr(self.root.ids.capture_status, "text", f"Capture error: {e}"), 0)
+                time.sleep(1.0)
+        Clock.schedule_once(lambda dt: setattr(self.root.ids.capture_status, "text", "Capture: idle"), 0)
+    def _finalize_chunk(self, tmp_path: Path) -> Path:
+        key = get_or_create_key()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        final_name = f"chunk_{ts}.mp4.aes"
+        final_path = CHUNKS_DIR / final_name
+        signature = compute_chunk_signature(tmp_path)
+        loop_detected = False
+        repeat_count = 0
+        try:
+            prior_sig = asyncio.run(fetch_security_state(key, "last_chunk_sig")) or ""
+            prior_count = asyncio.run(fetch_security_state(key, "last_chunk_repeat")) or "0"
+            repeat_count = int(prior_count)
+            if prior_sig == signature:
+                repeat_count += 1
+            else:
+                repeat_count = 0
+            loop_detected = repeat_count >= 3
+            asyncio.run(upsert_security_state(key, "last_chunk_sig", signature))
+            asyncio.run(upsert_security_state(key, "last_chunk_repeat", str(repeat_count)))
+        except Exception:
+            pass
+        try:
+            encrypt_file(tmp_path, final_path, key)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            asyncio.run(append_media_chunk(key, str(final_path), CHUNK_SECONDS, signature, loop_detected))
+        except Exception:
+            pass
+        if loop_detected:
+            try:
+                asyncio.run(
+                    append_security_event(
+                        key,
+                        kind="loop_detected",
+                        severity="high",
+                        details=f"chunk_signature={signature[:12]} repeats={repeat_count}",
+                    )
+                )
+            except Exception:
+                pass
+        self._cleanup_old_chunks()
+        return final_path
+    def _cleanup_old_chunks(self):
+        try:
+            chunks = sorted(CHUNKS_DIR.glob("chunk_*.mp4.aes"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for extra in chunks[CHUNK_KEEP_LIMIT:]:
+                extra.unlink(missing_ok=True)
+        except Exception:
+            pass
     def gui_model_refresh(self):
         s = []
         s.append(f"Encrypted: {'YES' if ENCRYPTED_MODEL.exists() else 'no'}")
@@ -1255,23 +1771,56 @@ class SecureLLMApp(MDApp):
             s.append(f"EncMB: {ENCRYPTED_MODEL.stat().st_size/1024/1024:.1f}")
         self.root.ids.model_status.text = " | ".join(s)
         self.root.ids.model_progress.value = 0
-    def gui_model_download(self):
-        self.set_status("Downloading...")
+    def gui_model_autoprepare(self):
+        if ENCRYPTED_MODEL.exists():
+            return
+        self.set_status("Auto-preparing model...")
         self.root.ids.model_progress.value = 0
         url = MODEL_REPO + MODEL_FILE
         def work():
-            get_or_create_key()
+            key = get_or_create_key()
+            if MODEL_PATH.exists():
+                with _MODEL_LOCK:
+                    encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
+                    MODEL_PATH.unlink(missing_ok=True)
+                return "Encrypted existing model."
             def cb(done, total):
                 if total > 0:
                     pct = int(done * 100 / total)
                     Clock.schedule_once(lambda dt: setattr(self.root.ids.model_progress, "value", pct), 0)
             sha = download_model_httpx_with_cb(url, MODEL_PATH, progress_cb=cb, timeout=None)
+            with _MODEL_LOCK:
+                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
+                MODEL_PATH.unlink(missing_ok=True)
+            return f"Downloaded+encrypted (SHA={sha[:12]}...)"
+        def done(msg):
+            self.set_status("")
+            self.gui_model_refresh()
+            self.root.ids.model_status.text = f"Auto model ready: {msg}"
+        def err(e):
+            self.set_status("")
+            self.root.ids.model_status.text = f"Auto model failed: {e}"
+        self._run_bg(work, done, err)
+    def gui_model_download(self):
+        self.set_status("Downloading...")
+        self.root.ids.model_progress.value = 0
+        url = MODEL_REPO + MODEL_FILE
+        def work():
+            key = get_or_create_key()
+            def cb(done, total):
+                if total > 0:
+                    pct = int(done * 100 / total)
+                    Clock.schedule_once(lambda dt: setattr(self.root.ids.model_progress, "value", pct), 0)
+            sha = download_model_httpx_with_cb(url, MODEL_PATH, progress_cb=cb, timeout=None)
+            with _MODEL_LOCK:
+                encrypt_file(MODEL_PATH, ENCRYPTED_MODEL, key)
+                MODEL_PATH.unlink(missing_ok=True)
             return sha
         def done(sha):
             self.set_status("")
             self.gui_model_refresh()
             ok = (sha.lower() == EXPECTED_HASH.lower())
-            self.root.ids.model_status.text = f"Downloaded SHA={sha} | expected={EXPECTED_HASH} | match={'YES' if ok else 'NO'}"
+            self.root.ids.model_status.text = f"Downloaded+encrypted SHA={sha} | expected={EXPECTED_HASH} | match={'YES' if ok else 'NO'}"
         def err(e):
             self.set_status("")
             self.root.ids.model_status.text = f"Download failed: {e}"
@@ -1343,7 +1892,7 @@ class SecureLLMApp(MDApp):
         search = self._hist_search
         def work():
             key = get_or_create_key()
-            asyncio.run(init_db(key))
+            asyncio.run(ensure_db_schema(key))
             rows = asyncio.run(fetch_history(key, limit=per_page, offset=page * per_page, search=search))
             return rows
         def done(rows):
@@ -1385,6 +1934,63 @@ class SecureLLMApp(MDApp):
         self._hist_search = None
         self._hist_page = 0
         self.gui_history_refresh()
+    def gui_playback_refresh(self):
+        self.set_status("Loading playback...")
+        self.root.ids.playback_list.clear_widgets()
+        page = self._playback_page
+        per_page = self._playback_per_page
+        alert_only = self._playback_alert_only
+        def work():
+            key = get_or_create_key()
+            asyncio.run(ensure_db_schema(key))
+            rows = asyncio.run(fetch_media_chunks(key, alert_only=alert_only, limit=per_page, offset=page * per_page))
+            return rows
+        def done(rows):
+            self.set_status("")
+            if not rows:
+                self.root.ids.playback_list.add_widget(TwoLineListItem(text="No chunks", secondary_text="—"))
+                return
+            for (rid, ts, path, duration, signature, alert) in rows:
+                label = f"[{rid}] {ts} ({duration}s)"
+                secondary = f"alert={'YES' if alert else 'no'} sig={signature[:10]}"
+                self.root.ids.playback_list.add_widget(
+                    TwoLineListItem(
+                        text=label,
+                        secondary_text=secondary,
+                        on_release=lambda item, p=path: self.gui_playback_select(p),
+                    )
+                )
+        def err(e):
+            self.set_status("")
+            self.root.ids.playback_status.text = f"Playback error: {e}"
+        self._run_bg(work, done, err)
+    def gui_playback_select(self, path: str):
+        key = get_or_create_key()
+        enc_path = Path(path)
+        if not enc_path.exists():
+            self.root.ids.playback_status.text = "Chunk missing."
+            return
+        tmp_plain = _tmp_path("playback", ".mp4")
+        try:
+            decrypt_file(enc_path, tmp_plain, key)
+        except Exception as e:
+            self.root.ids.playback_status.text = f"Decrypt failed: {e}"
+            return
+        if self._playback_tmp:
+            try:
+                Path(self._playback_tmp).unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._playback_tmp = str(tmp_plain)
+        self.root.ids.playback_video.source = self._playback_tmp
+        self.root.ids.playback_video.state = "play"
+        self.root.ids.playback_status.text = f"Playing {enc_path.name}"
+    def gui_playback_stop(self):
+        try:
+            self.root.ids.playback_video.state = "stop"
+        except Exception:
+            pass
+        self.root.ids.playback_status.text = "Stopped."
     def _gui_rekey_common(self, make_new_key_fn: Callable[[], bytes]):
         self.set_status("Rekeying...")
         self.root.ids.rekey_progress.value = 5

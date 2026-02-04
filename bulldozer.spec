@@ -22,7 +22,7 @@ fullscreen = 0
 
 include_patterns = models/*,*.gguf,*.aes,*.db,*.json
 
-android.permissions = INTERNET,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
+android.permissions = INTERNET,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,CAMERA,RECORD_AUDIO,FOREGROUND_SERVICE,WAKE_LOCK
 
 android.sdk_path = /usr/local/lib/android/sdk
 
