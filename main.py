@@ -29,13 +29,15 @@ from kivy.uix.video import Video
 from kivy.animation import Animation
 from kivy.metrics import dp
 from kivy.graphics import Color, Line, RoundedRectangle, Rectangle
+from kivy.graphics.texture import Texture
 from kivy.properties import NumericProperty, StringProperty, ListProperty
 from kivymd.app import MDApp
 from kivymd.uix.dialog import MDDialog
-from kivymd.uix.button import MDFlatButton
+from kivymd.uix.button import MDFlatButton, MDRaisedButton
 from kivymd.uix.list import TwoLineListItem
 from kivymd.uix.textfield import MDTextField
 from kivymd.uix.boxlayout import MDBoxLayout
+from kivymd.uix.toolbar import MDTopAppBar
 
 try:
     from jnius import autoclass
@@ -559,6 +561,211 @@ def metrics_to_rgb(metrics: dict) -> Tuple[float, float, float]:
     r, g, b = r / maxi, g / maxi, b / maxi
     return (float(max(0.0, min(1.0, r))), float(max(0.0, min(1.0, g))), float(max(0.0, min(1.0, b))))
 
+def _normalize_rgb(values: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    r, g, b = values
+    max_val = max(r, g, b)
+    if max_val > 1.5:
+        r, g, b = r / 255.0, g / 255.0, b / 255.0
+    return (
+        float(max(0.0, min(1.0, r))),
+        float(max(0.0, min(1.0, g))),
+        float(max(0.0, min(1.0, b))),
+    )
+
+def parse_color_samples(text: str) -> Dict[str, Tuple[float, float, float]]:
+    if not text:
+        return {}
+    if text.strip().lower() in {"none", "n/a", "na", "null"}:
+        return {}
+    entries = [e.strip() for e in re.split(r"[\n;|]+", text) if e.strip()]
+    results: Dict[str, Tuple[float, float, float]] = {}
+    auto_idx = 1
+    for entry in entries:
+        label = None
+        value = entry
+        if ":" in entry or "=" in entry:
+            parts = re.split(r"[:=]", entry, maxsplit=1)
+            label = parts[0].strip() or None
+            value = parts[1].strip() if len(parts) > 1 else ""
+        rgb: Optional[Tuple[float, float, float]] = None
+        if re.fullmatch(r"#?[0-9a-fA-F]{6}", value or ""):
+            hex_value = value.lstrip("#")
+            rgb = (
+                int(hex_value[0:2], 16) / 255.0,
+                int(hex_value[2:4], 16) / 255.0,
+                int(hex_value[4:6], 16) / 255.0,
+            )
+        else:
+            nums = [float(x) for x in re.findall(r"[0-9.]+", value)]
+            if len(nums) >= 3:
+                rgb = _normalize_rgb((nums[0], nums[1], nums[2]))
+        if rgb is None:
+            continue
+        if not label:
+            label = f"color_{auto_idx}"
+        base_label = label
+        suffix = 1
+        while label in results:
+            suffix += 1
+            label = f"{base_label}_{suffix}"
+        results[label] = _normalize_rgb(rgb)
+        auto_idx += 1
+    return results
+
+def compute_color_change_metrics(alarm_text: str, settle_text: str) -> Dict[str, object]:
+    alarm = parse_color_samples(alarm_text)
+    settle = parse_color_samples(settle_text)
+    labels = sorted(set(alarm.keys()) | set(settle.keys()))
+    changes = []
+    total_delta = 0.0
+    max_delta = 0.0
+    changed_labels = []
+    for label in labels:
+        a = alarm.get(label, (0.0, 0.0, 0.0))
+        s = settle.get(label, (0.0, 0.0, 0.0))
+        delta = math.sqrt(((a[0] - s[0]) ** 2 + (a[1] - s[1]) ** 2 + (a[2] - s[2]) ** 2) / 3.0)
+        changes.append({"label": label, "alarm": a, "settle": s, "delta": delta})
+        total_delta += delta
+        max_delta = max(max_delta, delta)
+        if delta >= 0.08 or label not in alarm or label not in settle:
+            changed_labels.append((label, delta))
+    avg_delta = total_delta / max(1, len(labels))
+    change_ratio = len(changed_labels) / max(1, len(labels))
+    return {
+        "labels": labels,
+        "changes": changes,
+        "changed_labels": changed_labels,
+        "avg_delta": float(avg_delta),
+        "max_delta": float(max_delta),
+        "change_ratio": float(change_ratio),
+        "alarm_count": len(alarm),
+        "settle_count": len(settle),
+    }
+
+def build_color_change_summary(metrics: Dict[str, object]) -> str:
+    labels = metrics.get("labels") or []
+    if not labels:
+        return "color_shift=none"
+    changed = metrics.get("changed_labels") or []
+    changed_text = ", ".join([f"{label}({delta:.2f})" for label, delta in changed]) or "none"
+    avg_delta = metrics.get("avg_delta", 0.0)
+    max_delta = metrics.get("max_delta", 0.0)
+    ratio = metrics.get("change_ratio", 0.0)
+    return f"color_shift=changed[{changed_text}] avg={avg_delta:.2f} max={max_delta:.2f} ratio={ratio:.2f}"
+
+def color_features_to_rgb(metrics: Dict[str, object]) -> Tuple[float, float, float]:
+    avg_delta = float(metrics.get("avg_delta", 0.0))
+    max_delta = float(metrics.get("max_delta", 0.0))
+    ratio = float(metrics.get("change_ratio", 0.0))
+    return _normalize_rgb((avg_delta, max_delta, ratio))
+
+def build_color_rag_context(metrics: Dict[str, object], entropy_score: float) -> str:
+    avg_delta = float(metrics.get("avg_delta", 0.0))
+    max_delta = float(metrics.get("max_delta", 0.0))
+    ratio = float(metrics.get("change_ratio", 0.0))
+    signals = [
+        {
+            "name": "low_shift",
+            "when": avg_delta < 0.08 and max_delta < 0.12 and ratio < 0.25,
+            "guidance": "Color field stable; treat as baseline activity unless other indicators spike.",
+        },
+        {
+            "name": "localized_shift",
+            "when": avg_delta < 0.14 and max_delta >= 0.12 and ratio < 0.45,
+            "guidance": "Localized color change; possible motion at a boundary or partial occlusion.",
+        },
+        {
+            "name": "broad_shift",
+            "when": avg_delta >= 0.14 or ratio >= 0.45,
+            "guidance": "Broad color change; likely movement, lighting disturbance, or tamper event.",
+        },
+        {
+            "name": "entropy_escalation",
+            "when": entropy_score >= 0.7,
+            "guidance": "High color entropy; increase risk posture unless corroborated as benign.",
+        },
+    ]
+    applicable = [s["guidance"] for s in signals if s["when"]]
+    if not applicable:
+        applicable = ["Color change is ambiguous; keep risk neutral without other signals."]
+    summary = f"avg_delta={avg_delta:.2f} max_delta={max_delta:.2f} ratio={ratio:.2f} entropy={entropy_score:.2f}"
+    return " | ".join([summary] + applicable)
+
+def normalize_risk_label(text: str, fallback: str = "Medium") -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return fallback
+    tokens = re.findall(r"[A-Za-z]+", cleaned.lower())
+    for token in tokens:
+        if token in {"low", "medium", "high"}:
+            return token.capitalize()
+    lowered = cleaned.lower()
+    if "low" in lowered:
+        return "Low"
+    if "medium" in lowered:
+        return "Medium"
+    if "high" in lowered:
+        return "High"
+    return fallback
+
+def risk_level_from_score(score: float) -> str:
+    if score >= 0.7:
+        return "High"
+    if score >= 0.45:
+        return "Medium"
+    return "Low"
+
+def combine_risk_labels(primary: str, secondary: str) -> str:
+    ranking = {"Low": 0, "Medium": 1, "High": 2}
+    p = ranking.get(primary, 1)
+    s = ranking.get(secondary, 1)
+    return primary if p >= s else secondary
+
+def pennylane_color_shift_risk(features: Tuple[float, float, float], shots: int = 256) -> float:
+    a, b, c = features
+    if qml is None or pnp is None:
+        seed = int((int(a * 255) << 16) | (int(b * 255) << 8) | int(c * 255))
+        random.seed(seed)
+        base = (0.5 * a + 0.3 * b + 0.2 * c)
+        noise = (random.random() - 0.5) * 0.06
+        return float(max(0.0, min(1.0, base + noise)))
+    dev = qml.device("default.qubit", wires=3, shots=shots)
+    @qml.qnode(dev)
+    def circuit(x, y, z):
+        qml.RX(x * math.pi, wires=0)
+        qml.RY(y * math.pi, wires=1)
+        qml.RZ(z * math.pi, wires=2)
+        qml.CNOT(wires=[0, 1])
+        qml.CZ(wires=[1, 2])
+        qml.RY((x + y) * math.pi / 2, wires=0)
+        qml.RX((y + z) * math.pi / 2, wires=2)
+        return qml.expval(qml.PauliZ(0)), qml.expval(qml.PauliZ(1)), qml.expval(qml.PauliZ(2))
+    try:
+        ev0, ev1, ev2 = circuit(float(a), float(b), float(c))
+        combined = ((ev0 + 1.0) / 2.0 * 0.5 + (ev1 + 1.0) / 2.0 * 0.3 + (ev2 + 1.0) / 2.0 * 0.2)
+        score = 1.0 / (1.0 + math.exp(-5.0 * (combined - 0.5)))
+        return float(max(0.0, min(1.0, score)))
+    except Exception:
+        return float(max(0.0, min(1.0, (a + b + c) / 3.0)))
+
+def forecast_risk_series(base_score: float, hours: int, seed: int) -> List[str]:
+    labels = []
+    for hour in range(1, hours + 1):
+        drift = math.sin((hour + seed) * 0.35) * 0.07 + math.cos((hour + seed) * 0.07) * 0.03
+        decay = math.exp(-hour / 240.0)
+        score = base_score * decay + (1.0 - decay) * 0.35 + drift
+        score = float(max(0.0, min(1.0, score)))
+        labels.append(risk_level_from_score(score))
+    return labels
+
+def summarize_forecast(labels: List[str], hours: int) -> str:
+    counts = {"Low": 0, "Medium": 0, "High": 0}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    head = ", ".join(labels[:min(6, len(labels))])
+    tail = ", ".join(labels[-min(6, len(labels)):]) if labels else ""
+    return f"{hours}h forecast L={counts['Low']} M={counts['Medium']} H={counts['High']} | start[{head}] end[{tail}]"
+
 def pennylane_entropic_score(rgb: Tuple[float, float, float], shots: int = 256) -> float:
     if qml is None or pnp is None:
         r, g, b = rgb
@@ -779,6 +986,11 @@ def build_security_scanner_prompt(data: dict, include_system_entropy: bool = Tru
         f"Camera notes: {data.get('camera_notes','none')}\n"
         f"Access control: {data.get('access_control','unknown')}\n"
         f"Frame signature: {data.get('frame_signature','none')}\n"
+        f"Movement alarm colors: {data.get('movement_alarm_colors','none')}\n"
+        f"Settle state colors: {data.get('settle_colors','none')}\n"
+        f"Color change summary: {data.get('color_change_summary','none')}\n"
+        f"Quantum color risk: {data.get('quantum_color_risk','unknown')}\n"
+        f"Color RAG context: {data.get('color_rag_context','none')}\n"
         f"LLM detection notes: {data.get('llm_detection','none')}\n"
         f"Tamper evidence: {data.get('tamper_evidence','none')}\n"
         f"{metrics_line}\n"
@@ -870,6 +1082,26 @@ async def mobile_run_chat(prompt: str) -> str:
 
 async def mobile_run_security_scan(data: dict) -> Tuple[str, str, Dict[str, str]]:
     key = await mobile_ensure_init()
+    color_metrics = compute_color_change_metrics(
+        data.get("movement_alarm_colors", ""),
+        data.get("settle_colors", ""),
+    )
+    color_summary = build_color_change_summary(color_metrics)
+    color_rgb = color_features_to_rgb(color_metrics)
+    color_entropy = pennylane_entropic_score(color_rgb)
+    color_rag_context = build_color_rag_context(color_metrics, color_entropy)
+    quantum_score = pennylane_color_shift_risk(
+        (
+            float(color_metrics.get("avg_delta", 0.0)),
+            float(color_metrics.get("max_delta", 0.0)),
+            float(color_metrics.get("change_ratio", 0.0)),
+        )
+    )
+    quantum_label = risk_level_from_score(quantum_score)
+    data = dict(data)
+    data["color_change_summary"] = color_summary
+    data["quantum_color_risk"] = f"{quantum_label} ({quantum_score:.2f})"
+    data["color_rag_context"] = color_rag_context
     prompt = build_security_scanner_prompt(data, include_system_entropy=True)
     frame_sig = data.get("frame_signature", "")
     frame_hash = frame_signature_hash(frame_sig) if frame_sig else ""
@@ -884,6 +1116,11 @@ async def mobile_run_security_scan(data: dict) -> Tuple[str, str, Dict[str, str]
             frame_changed = False
     llm_level, llm_score = llm_detection_signal(data.get("llm_detection", ""))
     tamper_note = data.get("tamper_evidence", "none")
+    seed = int(hashlib.sha256(color_summary.encode("utf-8")).hexdigest(), 16) % 997
+    forecast_47 = forecast_risk_series(quantum_score, 47, seed)
+    forecast_700 = forecast_risk_series(quantum_score, 700, seed + 37)
+    forecast_47_summary = summarize_forecast(forecast_47, 47)
+    forecast_700_summary = summarize_forecast(forecast_700, 700)
     try:
         with acquire_plain_model(key) as model_path:
             loop = asyncio.get_running_loop()
@@ -896,18 +1133,8 @@ async def mobile_run_security_scan(data: dict) -> Tuple[str, str, Dict[str, str]
                     return chunked_generate(llm=llm, prompt=prompt, max_total_tokens=256, chunk_tokens=64, base_temperature=0.18, punkd_profile="balanced", streaming_callback=None)
                 result = await loop.run_in_executor(ex, run_chunked)
                 text = (result or "").strip().replace("You are a helpful AI assistant named SmolLM, trained by Hugging Face", "")
-                candidate = text.split()
-                label = candidate[0].capitalize() if candidate else ""
-                if label not in ("Low", "Medium", "High"):
-                    lowered = text.lower()
-                    if "low" in lowered:
-                        label = "Low"
-                    elif "medium" in lowered:
-                        label = "Medium"
-                    elif "high" in lowered:
-                        label = "High"
-                    else:
-                        label = "Medium"
+                label = normalize_risk_label(text, fallback="Medium")
+                label = combine_risk_labels(label, quantum_label)
                 try:
                     await log_interaction("SECURITY_SCANNER_PROMPT:\n" + prompt, "SECURITY_SCANNER_RESULT:\n" + label, key)
                 except Exception:
@@ -920,19 +1147,45 @@ async def mobile_run_security_scan(data: dict) -> Tuple[str, str, Dict[str, str]
                     "frame_changed": "YES" if frame_changed else "no",
                     "llm_detection": f"{llm_level} ({llm_score:.2f})",
                     "tamper_evidence": tamper_note or "none",
+                    "color_shift": color_summary,
+                    "quantum_color_risk": f"{quantum_label} ({quantum_score:.2f})",
+                    "color_rag_context": color_rag_context,
+                    "forecast_47h": forecast_47_summary,
+                    "forecast_700h": forecast_700_summary,
+                    "forecast_47h_series": forecast_47,
+                    "forecast_700h_series": forecast_700,
                 }
                 try:
                     await append_security_event(
                         key,
                         kind="scan",
                         severity=label.lower(),
-                        details=f"frame_changed={meta['frame_changed']} llm={meta['llm_detection']} tamper={meta['tamper_evidence']}",
+                        details=(
+                            f"frame_changed={meta['frame_changed']} llm={meta['llm_detection']} "
+                            f"tamper={meta['tamper_evidence']} color_shift={color_summary} "
+                            f"quantum_color={meta['quantum_color_risk']}"
+                        ),
                     )
                 except Exception:
                     pass
                 return label, text, meta
     except FileNotFoundError:
-        return "[Model not found]", "[Model not found. Place or download the GGUF model on device.]", {"frame_changed": "unknown", "llm_detection": "unknown", "tamper_evidence": "unknown"}
+        return (
+            "[Model not found]",
+            "[Model not found. Place or download the GGUF model on device.]",
+            {
+                "frame_changed": "unknown",
+                "llm_detection": "unknown",
+                "tamper_evidence": "unknown",
+                "color_shift": color_summary,
+                "quantum_color_risk": f"{quantum_label} ({quantum_score:.2f})",
+                "color_rag_context": color_rag_context,
+                "forecast_47h": forecast_47_summary,
+                "forecast_700h": forecast_700_summary,
+                "forecast_47h_series": forecast_47,
+                "forecast_700h_series": forecast_700,
+            },
+        )
 
 class BackgroundGradient(Widget):
     top_color = ListProperty([0.07, 0.09, 0.14, 1])
@@ -995,6 +1248,57 @@ class GlassCard(Widget):
                 sx = x + w * self._shine_x
                 Color(1, 1, 1, float(self._shine_alpha))
                 Rectangle(pos=(sx, y), size=(w * 0.18, h))
+
+class GradientButton(MDRaisedButton):
+    start_color = ListProperty([0.16, 0.48, 0.96, 1])
+    end_color = ListProperty([0.42, 0.25, 0.96, 1])
+    steps = NumericProperty(24)
+    radius = NumericProperty(dp(18))
+    border_color = ListProperty([1, 1, 1, 0.18])
+    border_width = NumericProperty(dp(1.0))
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.md_bg_color = (0, 0, 0, 0)
+        self.elevation = 0
+        self.bind(
+            pos=self._redraw,
+            size=self._redraw,
+            start_color=self._redraw,
+            end_color=self._redraw,
+            steps=self._redraw,
+            radius=self._redraw,
+            border_color=self._redraw,
+            border_width=self._redraw,
+        )
+        Clock.schedule_once(lambda dt: self._redraw(), 0)
+    def _build_gradient_texture(self) -> Texture:
+        steps = max(2, int(self.steps))
+        buf = bytearray()
+        for i in range(steps):
+            t = i / (steps - 1)
+            r = self.start_color[0] + (self.end_color[0] - self.start_color[0]) * t
+            g = self.start_color[1] + (self.end_color[1] - self.start_color[1]) * t
+            b = self.start_color[2] + (self.end_color[2] - self.start_color[2]) * t
+            a = self.start_color[3] + (self.end_color[3] - self.start_color[3]) * t
+            buf.extend([int(255 * r), int(255 * g), int(255 * b), int(255 * a)])
+        texture = Texture.create(size=(1, steps), colorfmt="rgba")
+        texture.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
+        texture.wrap = "repeat"
+        texture.mag_filter = "linear"
+        texture.min_filter = "linear"
+        return texture
+    def _redraw(self, *args):
+        self.canvas.before.clear()
+        x, y = self.pos
+        w, h = self.size
+        if w <= 0 or h <= 0:
+            return
+        texture = self._build_gradient_texture()
+        with self.canvas.before:
+            Color(1, 1, 1, 1)
+            RoundedRectangle(pos=(x, y), size=(w, h), radius=[self.radius], texture=texture)
+            Color(*self.border_color)
+            Line(rounded_rectangle=[x, y, w, h, self.radius], width=self.border_width)
 
 class ColorTab(Widget):
     rgb = ListProperty([0.2, 0.6, 0.9, 1.0])
@@ -1106,16 +1410,25 @@ KV = r"""
     size_hint: None, None
 <RiskWheelNeo>:
     size_hint: None, None
+<GradientButton>:
+    font_style: "Button"
+    text_color: 0.98, 0.99, 1, 1
 
 MDScreen:
     MDBoxLayout:
         orientation: "vertical"
-        MDToolbar:
+        MDTopAppBar:
             title: "Secure LLM Security Scanner"
             elevation: 10
+            md_bg_color: 0.04, 0.05, 0.08, 1
+            specific_text_color: 0.96, 0.97, 0.99, 1
+            title_align: "left"
+            left_action_items: [["shield-check", lambda x: None]]
+            right_action_items: [["bell-outline", lambda x: None], ["cog-outline", lambda x: None]]
         MDLabel:
             id: status_label
             text: ""
+            color: 0.78, 0.82, 0.88, 1
             size_hint_y: None
             height: "24dp"
             halign: "center"
@@ -1159,9 +1472,11 @@ MDScreen:
                                 hint_text: "Type your message"
                                 multiline: False
                                 on_text_validate: app.on_chat_send()
-                            MDRaisedButton:
+                            GradientButton:
                                 text: "Send"
                                 size_hint_x: 1
+                                start_color: 0.18, 0.5, 0.96, 1
+                                end_color: 0.55, 0.3, 0.98, 1
                                 on_release: app.on_chat_send()
 
             MDScreen:
@@ -1254,6 +1569,16 @@ MDScreen:
                                 mode: "fill"
                                 fill_color: 1, 1, 1, 0.06
                             MDTextField:
+                                id: movement_alarm_field
+                                hint_text: "Movement alarm colors (label:#RRGGBB; label:120,30,40)"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDTextField:
+                                id: settle_field
+                                hint_text: "Settle state colors (label:#RRGGBB; label:120,30,40)"
+                                mode: "fill"
+                                fill_color: 1, 1, 1, 0.06
+                            MDTextField:
                                 id: llm_field
                                 hint_text: "LLM detection notes (if any)"
                                 mode: "fill"
@@ -1269,15 +1594,33 @@ MDScreen:
                                 theme_text_color: "Secondary"
                                 size_hint_y: None
                                 height: "20dp"
+                            MDLabel:
+                                id: color_change_status
+                                text: "Color shift: —"
+                                theme_text_color: "Secondary"
+                                size_hint_y: None
+                                height: "34dp"
+                                halign: "center"
+                            MDLabel:
+                                id: forecast_status
+                                text: "Forecast: —"
+                                theme_text_color: "Secondary"
+                                size_hint_y: None
+                                height: "44dp"
+                                halign: "center"
                             MDBoxLayout:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Start 24/7 Capture"
+                                    start_color: 0.14, 0.65, 0.42, 1
+                                    end_color: 0.12, 0.45, 0.3, 1
                                     on_release: app.gui_start_capture()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Stop Capture"
+                                    start_color: 0.85, 0.25, 0.35, 1
+                                    end_color: 0.65, 0.15, 0.25, 1
                                     on_release: app.gui_stop_capture()
                             MDLabel:
                                 id: capture_status
@@ -1285,9 +1628,11 @@ MDScreen:
                                 theme_text_color: "Secondary"
                                 size_hint_y: None
                                 height: "20dp"
-                            MDRaisedButton:
+                            GradientButton:
                                 text: "Scan Security Risk"
                                 size_hint_x: 1
+                                start_color: 0.18, 0.5, 0.96, 1
+                                end_color: 0.55, 0.3, 0.98, 1
                                 on_release: app.on_scan()
                             MDLabel:
                                 id: scan_result
@@ -1339,27 +1684,39 @@ MDScreen:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Download"
+                                    start_color: 0.14, 0.65, 0.42, 1
+                                    end_color: 0.12, 0.45, 0.3, 1
                                     on_release: app.gui_model_download()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Verify SHA"
+                                    start_color: 0.26, 0.33, 0.52, 1
+                                    end_color: 0.18, 0.23, 0.36, 1
                                     on_release: app.gui_model_verify()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Encrypt"
+                                    start_color: 0.95, 0.62, 0.22, 1
+                                    end_color: 0.85, 0.45, 0.15, 1
                                     on_release: app.gui_model_encrypt()
                             MDBoxLayout:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Decrypt"
+                                    start_color: 0.95, 0.62, 0.22, 1
+                                    end_color: 0.85, 0.45, 0.15, 1
                                     on_release: app.gui_model_decrypt()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Delete plain"
+                                    start_color: 0.85, 0.25, 0.35, 1
+                                    end_color: 0.65, 0.15, 0.25, 1
                                     on_release: app.gui_model_delete_plain()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Refresh"
+                                    start_color: 0.26, 0.33, 0.52, 1
+                                    end_color: 0.18, 0.23, 0.36, 1
                                     on_release: app.gui_model_refresh()
 
             MDScreen:
@@ -1401,11 +1758,15 @@ MDScreen:
                                     hint_text: "Search prompt/response"
                                     mode: "fill"
                                     fill_color: 1, 1, 1, 0.06
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Search"
+                                    start_color: 0.18, 0.5, 0.96, 1
+                                    end_color: 0.55, 0.3, 0.98, 1
                                     on_release: app.gui_history_search()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Clear"
+                                    start_color: 0.85, 0.25, 0.35, 1
+                                    end_color: 0.65, 0.15, 0.25, 1
                                     on_release: app.gui_history_clear()
                             MDLabel:
                                 id: history_meta
@@ -1420,14 +1781,20 @@ MDScreen:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Prev"
+                                    start_color: 0.26, 0.33, 0.52, 1
+                                    end_color: 0.18, 0.23, 0.36, 1
                                     on_release: app.gui_history_prev()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Next"
+                                    start_color: 0.26, 0.33, 0.52, 1
+                                    end_color: 0.18, 0.23, 0.36, 1
                                     on_release: app.gui_history_next()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Refresh"
+                                    start_color: 0.26, 0.33, 0.52, 1
+                                    end_color: 0.18, 0.23, 0.36, 1
                                     on_release: app.gui_history_refresh()
 
             MDScreen:
@@ -1467,11 +1834,15 @@ MDScreen:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "New random key"
+                                    start_color: 0.18, 0.5, 0.96, 1
+                                    end_color: 0.55, 0.3, 0.98, 1
                                     on_release: app.gui_rekey_random()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Passphrase key"
+                                    start_color: 0.18, 0.5, 0.96, 1
+                                    end_color: 0.55, 0.3, 0.98, 1
                                     on_release: app.gui_rekey_passphrase_dialog()
                             MDProgressBar:
                                 id: rekey_progress
@@ -1531,11 +1902,15 @@ MDScreen:
                                 spacing: "8dp"
                                 size_hint_y: None
                                 height: "44dp"
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Refresh"
+                                    start_color: 0.26, 0.33, 0.52, 1
+                                    end_color: 0.18, 0.23, 0.36, 1
                                     on_release: app.gui_playback_refresh()
-                                MDRaisedButton:
+                                GradientButton:
                                     text: "Stop"
+                                    start_color: 0.85, 0.25, 0.35, 1
+                                    end_color: 0.65, 0.15, 0.25, 1
                                     on_release: app.gui_playback_stop()
 
         MDBottomNavigation:
@@ -1586,6 +1961,8 @@ class SecureLLMApp(MDApp):
     def build(self):
         self.title = "Secure LLM Security Scanner"
         self.theme_cls.primary_palette = "Blue"
+        self.last_forecast_47 = []
+        self.last_forecast_700 = []
         root = Builder.load_string(KV)
         if request_permissions and Permission:
             request_permissions([Permission.CAMERA, Permission.RECORD_AUDIO, Permission.WRITE_EXTERNAL_STORAGE])
@@ -1643,6 +2020,8 @@ class SecureLLMApp(MDApp):
             "camera_notes": road_screen.ids.camera_field.text.strip() or "none",
             "access_control": road_screen.ids.access_field.text.strip() or "unknown",
             "frame_signature": road_screen.ids.frame_field.text.strip() or "none",
+            "movement_alarm_colors": road_screen.ids.movement_alarm_field.text.strip() or "none",
+            "settle_colors": road_screen.ids.settle_field.text.strip() or "none",
             "llm_detection": road_screen.ids.llm_field.text.strip() or "none",
             "tamper_evidence": road_screen.ids.tamper_field.text.strip() or "none",
         }
@@ -1666,6 +2045,16 @@ class SecureLLMApp(MDApp):
             road_screen.ids.alert_status.text = f"Alerts: frame_change={meta.get('frame_changed')} llm={meta.get('llm_detection')} tamper={meta.get('tamper_evidence')}"
         except Exception:
             pass
+        try:
+            road_screen.ids.color_change_status.text = f"Color shift: {meta.get('color_shift', 'none')} | Quantum risk: {meta.get('quantum_color_risk', 'unknown')}"
+        except Exception:
+            pass
+        try:
+            road_screen.ids.forecast_status.text = f"{meta.get('forecast_47h', '47h forecast unavailable')} | {meta.get('forecast_700h', '700h forecast unavailable')}"
+        except Exception:
+            pass
+        self.last_forecast_47 = meta.get("forecast_47h_series", [])
+        self.last_forecast_700 = meta.get("forecast_700h_series", [])
         try:
             metrics = collect_system_metrics()
             rgb = metrics_to_rgb(metrics)
