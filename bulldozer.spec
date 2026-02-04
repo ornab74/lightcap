@@ -3,7 +3,7 @@
 
 title = LightCap
 
-package.name = securellmroads
+package.name = lightcal
 package.domain = com.qroadscan
 
 source.dir = .
