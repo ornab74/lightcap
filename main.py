@@ -1,14 +1,15 @@
 
 import os, sys, time, json, hashlib, asyncio, threading, httpx, aiosqlite, math, random, re, uuid, tempfile
+import importlib
+import importlib.util
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List, Tuple, Callable, Dict
+from typing import Optional, List, Tuple, Callable, Dict, Any
 from contextlib import contextmanager
 from threading import RLock
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from llama_cpp import Llama
 
 try:
     import psutil
@@ -384,7 +385,12 @@ async def fetch_media_chunks(key: bytes, alert_only: bool = False, limit: int = 
                 pass
         return rows
 
-def load_llama_model_blocking(model_path: Path) -> Llama:
+def load_llama_model_blocking(model_path: Path) -> Any:
+    spec = importlib.util.find_spec("llama_cpp")
+    if spec is None:
+        raise RuntimeError("llama_cpp is not available in this build")
+    llama_mod = importlib.import_module("llama_cpp")
+    Llama = getattr(llama_mod, "Llama")
     return Llama(model_path=str(model_path), n_ctx=2048, n_threads=max(2, (os.cpu_count() or 4) // 2))
 
 def _read_proc_stat():
@@ -916,7 +922,7 @@ def punkd_apply(prompt_text: str, token_weights: Dict[str, float], profile: str 
     patched = prompt_text + "\n\n[PUNKD_MARKERS] " + markers
     return patched, multiplier
 
-def chunked_generate(llm: Llama, prompt: str, max_total_tokens: int = 256, chunk_tokens: int = 64, base_temperature: float = 0.2, punkd_profile: str = "balanced", streaming_callback: Optional[Callable[[str], None]] = None) -> str:
+def chunked_generate(llm: Any, prompt: str, max_total_tokens: int = 256, chunk_tokens: int = 64, base_temperature: float = 0.2, punkd_profile: str = "balanced", streaming_callback: Optional[Callable[[str], None]] = None) -> str:
     assembled = ""
     cur_prompt = prompt
     token_weights = punkd_analyze(prompt, top_n=16)
